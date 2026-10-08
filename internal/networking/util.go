@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 
 	"github.com/bytedance/sonic"
 )
@@ -42,7 +43,9 @@ func (client *HTTPClient) FetchWithContext(
 		req.Header.Set(k, v)
 	}
 	for _, cookie := range client.Cookies {
-		req.AddCookie(cookie)
+		if cookieMatchesHost(cookie, req.URL.Hostname()) {
+			req.AddCookie(cookie)
+		}
 	}
 	for k, v := range params.Headers {
 		req.Header.Set(k, v)
@@ -59,6 +62,18 @@ func (client *HTTPClient) FetchWithContext(
 		return nil, err
 	}
 	return resp, nil
+}
+
+// cookieMatchesHost reports whether a client scoped cookie may be sent
+// to host, so that a session cookie never leaves its own domain (third
+// party services, cdns). cookies without a domain are sent everywhere.
+func cookieMatchesHost(cookie *http.Cookie, host string) bool {
+	domain := strings.ToLower(strings.TrimPrefix(cookie.Domain, "."))
+	if domain == "" {
+		return true
+	}
+	host = strings.ToLower(host)
+	return host == domain || strings.HasSuffix(host, "."+domain)
 }
 
 func generateChromeUA() string {
