@@ -27,6 +27,7 @@ import (
 
 const (
 	postPageURL     = "https://www.instagram.com/p/%s/"
+	mediaInfoURL    = "https://www.instagram.com/api/v1/media/%s/info/"
 	graphQLEndpoint = "https://www.instagram.com/graphql/query"
 	webInfoQuery    = "PolarisPostRootQuery"
 	// doc_id of webInfoQuery, taken from the web client bundle.
@@ -386,6 +387,49 @@ func ParseWebTokens(body []byte) (*webTokens, error) {
 // instead of data, which can be transient.
 var errGraphQLRejected = errors.New("graphql request rejected")
 
+// errGraphQLRestricted means the post exists but this viewer may not see it
+// (age restricted, private), which a logged in viewer can sometimes bypass.
+var errGraphQLRestricted = errors.New("post is restricted")
+
+// errTransport marks requests that never got an answer from instagram
+// (proxy down, timeout), which say nothing about the account's health.
+var errTransport = errors.New("request failed")
+
+// the tokens sit in the first ~150 KB of a ~700 KB page
+const tokenReadLimit = 400 << 10
+
+// ReadWebTokens reads the post page only until all tokens were seen,
+// which saves a lot of bandwidth, especially through a proxy.
+func ReadWebTokens(r io.Reader) (*webTokens, error) {
+	var (
+		buf     bytes.Buffer
+		chunk   = make([]byte, 32<<10)
+		readErr error
+	)
+	for buf.Len() < tokenReadLimit {
+		n, err := r.Read(chunk)
+		buf.Write(chunk[:n])
+		if tokens, perr := ParseWebTokens(buf.Bytes()); perr == nil &&
+			tokens.HSI != "" && tokens.HasteSession != "" {
+			return tokens, nil
+		}
+		if err != nil {
+			if err != io.EOF {
+				readErr = err
+			}
+			break
+		}
+	}
+	tokens, err := ParseWebTokens(buf.Bytes())
+	if err != nil {
+		if readErr != nil {
+			return nil, fmt.Errorf("failed to read post page: %w: %w", errTransport, readErr)
+		}
+		return nil, err
+	}
+	return tokens, nil
+}
+
 func GetGQLData(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 	var (
 		item *WebInfoItem
@@ -399,6 +443,15 @@ func GetGQLData(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 		ctx.Debugf("graphql request rejected, retrying: %v", err)
 	}
 	return nil, err
+}
+
+func cookieValue(cookies []*http.Cookie, name string) string {
+	for _, cookie := range cookies {
+		if cookie.Name == name {
+			return cookie.Value
+		}
+	}
+	return ""
 }
 
 // ParseGraphQLResponse decodes a graphql body, which instagram
@@ -415,6 +468,7 @@ func ParseGraphQLResponse(body []byte) (*GraphQLResponse, error) {
 	return &response, nil
 }
 
+// fetchWebInfo looks a post up like the anonymous web client does.
 func fetchWebInfo(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 	pageResp, err := ctx.Fetch(
 		http.MethodGet,
@@ -422,28 +476,19 @@ func fetchWebInfo(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 		&networking.RequestParams{Headers: pageHeaders},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to fetch post page: %w", err)
+		return nil, fmt.Errorf("failed to fetch post page: %w: %w", errTransport, err)
 	}
 	defer pageResp.Body.Close()
 
 	if pageResp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("failed to fetch post page: %s", pageResp.Status)
 	}
-	page, err := io.ReadAll(pageResp.Body)
+	tokens, err := ReadWebTokens(pageResp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read post page: %w", err)
-	}
-	tokens, err := ParseWebTokens(page)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse post page: %w", err)
+		return nil, fmt.Errorf("failed to get post page tokens: %w", err)
 	}
 	cookies := pageResp.Cookies()
-	var csrfToken string
-	for _, cookie := range cookies {
-		if cookie.Name == "csrftoken" {
-			csrfToken = cookie.Value
-		}
-	}
+	csrfToken := cookieValue(cookies, "csrftoken")
 
 	variables, err := sonic.ConfigFastest.Marshal(map[string]any{
 		"shortcode":               ctx.ContentID,
@@ -500,7 +545,7 @@ func fetchWebInfo(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to send request: %w", err)
+		return nil, fmt.Errorf("failed to send request: %w: %w", errTransport, err)
 	}
 	defer resp.Body.Close()
 
@@ -519,7 +564,11 @@ func fetchWebInfo(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 	}
 	if response.Data == nil || response.Data.WebInfo == nil {
 		if len(response.Errors) > 0 {
-			return nil, fmt.Errorf("graphql error: %s", response.Errors[0].Message)
+			msg := response.Errors[0].Message
+			if strings.Contains(msg, "field_exception") {
+				return nil, fmt.Errorf("%w: graphql error: %s", errGraphQLRestricted, msg)
+			}
+			return nil, fmt.Errorf("graphql error: %s", msg)
 		}
 		return nil, fmt.Errorf("data is nil")
 	}
@@ -527,6 +576,94 @@ func fetchWebInfo(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 		return nil, util.ErrUnavailable
 	}
 	return response.Data.WebInfo.Items[0], nil
+}
+
+const mediaIDAlphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// ShortcodeToMediaID converts a post shortcode to its numeric media id,
+// the shortcode is that id written in a base64 variant.
+func ShortcodeToMediaID(shortcode string) (string, error) {
+	if shortcode == "" || len(shortcode) > 11 {
+		return "", fmt.Errorf("invalid shortcode: %q", shortcode)
+	}
+	var id uint64
+	for _, c := range shortcode {
+		idx := strings.IndexRune(mediaIDAlphabet, c)
+		if idx < 0 {
+			return "", fmt.Errorf("invalid shortcode: %q", shortcode)
+		}
+		id = id<<6 | uint64(idx)
+	}
+	return strconv.FormatUint(id, 10), nil
+}
+
+// MediaInfoResponse is the body of /api/v1/media/<id>/info/.
+type MediaInfoResponse struct {
+	Status  string         `json:"status"`
+	Message string         `json:"message"`
+	Items   []*WebInfoItem `json:"items"`
+}
+
+func ParseMediaInfoResponse(body []byte) (*WebInfoItem, error) {
+	var response MediaInfoResponse
+	if err := sonic.ConfigFastest.Unmarshal(body, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w (body: %.200q)", err, body)
+	}
+	if response.Status != "ok" {
+		return nil, fmt.Errorf("media info failed: %s %s", response.Status, response.Message)
+	}
+	if len(response.Items) == 0 {
+		return nil, util.ErrUnavailable
+	}
+	return response.Items[0], nil
+}
+
+// fetchMediaInfo looks a post up with the logged in session client, using
+// a single request. a redirect means instagram did not accept the session.
+func fetchMediaInfo(ctx *models.ExtractorContext) (*WebInfoItem, error) {
+	mediaID, err := ShortcodeToMediaID(ctx.ContentID)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := fmt.Sprintf(mediaInfoURL, mediaID)
+	resp, err := ctx.SessionHTTPClient.FetchWithContext(
+		ctx.Context,
+		http.MethodGet,
+		endpoint,
+		&networking.RequestParams{Headers: map[string]string{
+			"User-Agent":       webUserAgent,
+			"Accept":           "*/*",
+			"Accept-Language":  "en-US,en;q=0.9",
+			"Referer":          fmt.Sprintf(postPageURL, ctx.ContentID),
+			"X-IG-App-ID":      webAppID,
+			"X-ASBD-ID":        "359341",
+			"X-IG-WWW-Claim":   "0",
+			"X-CSRFToken":      cookieValue(ctx.SessionHTTPClient.Cookies, "csrftoken"),
+			"X-Requested-With": "XMLHttpRequest",
+			"Sec-Fetch-Site":   "same-origin",
+			"Sec-Fetch-Mode":   "cors",
+			"Sec-Fetch-Dest":   "empty",
+		}},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %w: %w", errTransport, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.Request.URL.Path != "/api/v1/media/"+mediaID+"/info/" {
+		return nil, fmt.Errorf("session not accepted, redirected to %q", resp.Request.URL.Path)
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, util.ErrUnavailable
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("invalid response code: %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w: %w", errTransport, err)
+	}
+	return ParseMediaInfoResponse(body)
 }
 
 func GetBestCandidate(candidates []*Candidates) *Candidates {

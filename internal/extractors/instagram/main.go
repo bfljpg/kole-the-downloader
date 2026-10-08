@@ -1,6 +1,7 @@
 package instagram
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -32,6 +33,17 @@ var Extractor = &models.Extractor{
 			return &models.ExtractorResponse{
 				Media: media,
 			}, nil
+		}
+		// restricted post (e.g. age restricted): only a logged in
+		// viewer can see it, so use the session if one is configured
+		if errors.Is(err1, errGraphQLRestricted) && ctx.SessionHTTPClient != nil {
+			media, errSession := GetSessionMedia(ctx)
+			if errSession == nil {
+				return &models.ExtractorResponse{
+					Media: media,
+				}, nil
+			}
+			ctx.Warnf("session lookup failed: %v", errSession)
 		}
 		// method 2: get media from embed page
 		media, err2 := GetEmbedMedia(ctx)
@@ -89,6 +101,38 @@ func GetGQLMedia(ctx *models.ExtractorContext) (*models.Media, error) {
 	item, err := GetGQLData(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get graph data: %w", err)
+	}
+	return ParseWebInfoMedia(ctx, item)
+}
+
+// GetSessionMedia looks a post up with the logged in session. it is a last
+// resort for restricted posts: every call is counted, and any failure other
+// than "still restricted" pauses the session so a flagged account is left alone.
+func GetSessionMedia(ctx *models.ExtractorContext) (*models.Media, error) {
+	if err := igSession.acquire(); err != nil {
+		return nil, err
+	}
+	ctx.Infof("restricted post, using session")
+	// a request that never reached instagram (flaky proxy) is safe to
+	// repeat once, anything instagram answered is never retried
+	var (
+		item *WebInfoItem
+		err  error
+	)
+	for range 2 {
+		item, err = fetchMediaInfo(ctx)
+		if !errors.Is(err, errTransport) {
+			break
+		}
+		ctx.Debugf("session request did not reach instagram, retrying: %v", err)
+	}
+	if err != nil {
+		if !errors.Is(err, errGraphQLRestricted) &&
+			!errors.Is(err, util.ErrUnavailable) &&
+			!errors.Is(err, errTransport) {
+			igSession.trip()
+		}
+		return nil, fmt.Errorf("failed to get graph data with session: %w", err)
 	}
 	return ParseWebInfoMedia(ctx, item)
 }

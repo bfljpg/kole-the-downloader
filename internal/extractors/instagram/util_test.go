@@ -1,12 +1,15 @@
 package instagram
 
 import (
+	"bytes"
 	"errors"
+	"io"
 	"testing"
 
 	"github.com/bytedance/sonic"
 	"github.com/govdbot/govd/internal/database"
 	"github.com/govdbot/govd/internal/models"
+	"github.com/govdbot/govd/internal/util"
 )
 
 func TestGQLMediaFormat(t *testing.T) {
@@ -128,5 +131,89 @@ func TestParseGraphQLResponse(t *testing.T) {
 				t.Fatalf("rejected = %v, want %v (err: %v)", errors.Is(err, errGraphQLRejected), tt.wantRejected, err)
 			}
 		})
+	}
+}
+
+type slowReader struct {
+	chunks [][]byte
+	err    error
+	reads  int
+}
+
+func (r *slowReader) Read(p []byte) (int, error) {
+	if r.reads >= len(r.chunks) {
+		return 0, r.err
+	}
+	n := copy(p, r.chunks[r.reads])
+	r.reads++
+	return n, nil
+}
+
+func TestReadWebTokens(t *testing.T) {
+	filler := bytes.Repeat([]byte("x"), 1000)
+	tokensPart := []byte(`["LSD",[],{"token":"abc"}] "client_revision":123 "hsi":"456" "haste_session":"789"`)
+
+	t.Run("stops once all tokens were seen", func(t *testing.T) {
+		r := &slowReader{chunks: [][]byte{filler, tokensPart, filler, filler}, err: io.EOF}
+		tokens, err := ReadWebTokens(r)
+		if err != nil || tokens.LSD != "abc" || tokens.HSI != "456" {
+			t.Fatalf("unexpected result: %+v, %v", tokens, err)
+		}
+		if r.reads != 2 {
+			t.Fatalf("expected to stop after 2 reads, got %d", r.reads)
+		}
+	})
+	t.Run("transport error is tagged", func(t *testing.T) {
+		r := &slowReader{chunks: [][]byte{filler}, err: errors.New("deadline exceeded")}
+		_, err := ReadWebTokens(r)
+		if !errors.Is(err, errTransport) {
+			t.Fatalf("expected a transport error, got %v", err)
+		}
+	})
+	t.Run("page without tokens is not a transport error", func(t *testing.T) {
+		r := &slowReader{chunks: [][]byte{filler}, err: io.EOF}
+		_, err := ReadWebTokens(r)
+		if err == nil || errors.Is(err, errTransport) {
+			t.Fatalf("expected a parse error, got %v", err)
+		}
+	})
+}
+
+func TestShortcodeToMediaID(t *testing.T) {
+	// pairs taken from real api responses
+	tests := []struct {
+		shortcode, want string
+		wantErr         bool
+	}{
+		{"DdRSR0Et9Mb", "3986047534181634843", false},
+		{"DeMYCMLiEm7", "4002679872459131323", false},
+		{"Ddyz7R4N29Z", "3995484193449013081", false},
+		{"B", "1", false},
+		{"BA", "64", false},
+		{"", "", true},
+		{"has space", "", true},
+		{"waytoolongshortcode", "", true},
+	}
+	for _, tt := range tests {
+		got, err := ShortcodeToMediaID(tt.shortcode)
+		if (err != nil) != tt.wantErr || got != tt.want {
+			t.Errorf("ShortcodeToMediaID(%q) = %q, %v; want %q (err %v)", tt.shortcode, got, err, tt.want, tt.wantErr)
+		}
+	}
+}
+
+func TestParseMediaInfoResponse(t *testing.T) {
+	item, err := ParseMediaInfoResponse([]byte(`{"status":"ok","items":[{"video_versions":[{"url":"https://cdn/v.mp4","width":720,"height":1280}]}]}`))
+	if err != nil || len(item.VideoVersions) != 1 {
+		t.Fatalf("unexpected result: %+v, %v", item, err)
+	}
+	if _, err := ParseMediaInfoResponse([]byte(`{"status":"ok","items":[]}`)); !errors.Is(err, util.ErrUnavailable) {
+		t.Fatalf("expected unavailable, got %v", err)
+	}
+	if _, err := ParseMediaInfoResponse([]byte(`{"status":"fail","message":"login_required"}`)); err == nil {
+		t.Fatal("expected an error for a failed response")
+	}
+	if _, err := ParseMediaInfoResponse([]byte(`<html>`)); err == nil {
+		t.Fatal("expected an error for a non-json body")
 	}
 }
