@@ -21,3 +21,4 @@ translate.*.toml
 
 # Agents
 CLAUDE.md
+.claude/
