@@ -37,6 +37,7 @@ var Extractor = &models.Extractor{
 		// restricted post (e.g. age restricted): only a logged in
 		// viewer can see it, so use the session if one is configured
 		if errors.Is(err1, errGraphQLRestricted) && ctx.SessionHTTPClient != nil {
+			ctx.Infof("restricted post")
 			media, errSession := GetSessionMedia(ctx)
 			if errSession == nil {
 				return &models.ExtractorResponse{
@@ -72,10 +73,22 @@ var StoriesExtractor = &models.Extractor{
 	Hidden:     true,
 
 	GetFunc: func(ctx *models.ExtractorContext) (*models.ExtractorResponse, error) {
-		media, err := GetIGramStory(ctx)
-		return &models.ExtractorResponse{
-			Media: media,
-		}, err
+		// method 1: get story from 3rd party service
+		media, err1 := GetIGramStory(ctx)
+		if err1 == nil || ctx.SessionHTTPClient == nil {
+			return &models.ExtractorResponse{
+				Media: media,
+			}, err1
+		}
+		// method 2: stories are never visible to anonymous viewers,
+		// so use the logged in session if one is configured
+		media, err2 := GetSessionStory(ctx)
+		if err2 == nil {
+			return &models.ExtractorResponse{
+				Media: media,
+			}, nil
+		}
+		return nil, fmt.Errorf("all methods failed: %w; %w", err1, err2)
 	},
 }
 
@@ -105,14 +118,30 @@ func GetGQLMedia(ctx *models.ExtractorContext) (*models.Media, error) {
 	return ParseWebInfoMedia(ctx, item)
 }
 
-// GetSessionMedia looks a post up with the logged in session. it is a last
-// resort for restricted posts: every call is counted, and any failure other
-// than "still restricted" pauses the session so a flagged account is left alone.
+// GetSessionMedia looks a restricted post up with the logged in session.
 func GetSessionMedia(ctx *models.ExtractorContext) (*models.Media, error) {
+	mediaID, err := ShortcodeToMediaID(ctx.ContentID)
+	if err != nil {
+		return nil, err
+	}
+	return getSessionMedia(ctx, mediaID, fmt.Sprintf(postPageURL, ctx.ContentID))
+}
+
+// GetSessionStory looks a story up with the logged in session, stories
+// are never visible to anonymous viewers. a story's id in its url is
+// already its media id.
+func GetSessionStory(ctx *models.ExtractorContext) (*models.Media, error) {
+	return getSessionMedia(ctx, ctx.ContentID, ctx.ContentURL)
+}
+
+// getSessionMedia is a last resort: every call is counted, and any failure
+// other than "still restricted" pauses the session so a flagged account
+// is left alone.
+func getSessionMedia(ctx *models.ExtractorContext, mediaID, referer string) (*models.Media, error) {
 	if err := igSession.acquire(); err != nil {
 		return nil, err
 	}
-	ctx.Infof("restricted post, using session")
+	ctx.Infof("using session")
 	// a request that never reached instagram (flaky proxy) is safe to
 	// repeat once, anything instagram answered is never retried
 	var (
@@ -120,7 +149,7 @@ func GetSessionMedia(ctx *models.ExtractorContext) (*models.Media, error) {
 		err  error
 	)
 	for range 2 {
-		item, err = fetchMediaInfo(ctx)
+		item, err = fetchMediaInfo(ctx, mediaID, referer)
 		if !errors.Is(err, errTransport) {
 			break
 		}
@@ -132,7 +161,7 @@ func GetSessionMedia(ctx *models.ExtractorContext) (*models.Media, error) {
 			!errors.Is(err, errTransport) {
 			igSession.trip()
 		}
-		return nil, fmt.Errorf("failed to get graph data with session: %w", err)
+		return nil, fmt.Errorf("failed to get media info with session: %w", err)
 	}
 	return ParseWebInfoMedia(ctx, item)
 }

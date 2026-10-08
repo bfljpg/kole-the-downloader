@@ -618,13 +618,10 @@ func ParseMediaInfoResponse(body []byte) (*WebInfoItem, error) {
 	return response.Items[0], nil
 }
 
-// fetchMediaInfo looks a post up with the logged in session client, using
-// a single request. a redirect means instagram did not accept the session.
-func fetchMediaInfo(ctx *models.ExtractorContext) (*WebInfoItem, error) {
-	mediaID, err := ShortcodeToMediaID(ctx.ContentID)
-	if err != nil {
-		return nil, err
-	}
+// fetchMediaInfo looks a post or story up by media id with the logged in
+// session client, using a single request. a redirect means instagram did
+// not accept the session.
+func fetchMediaInfo(ctx *models.ExtractorContext, mediaID, referer string) (*WebInfoItem, error) {
 	endpoint := fmt.Sprintf(mediaInfoURL, mediaID)
 	resp, err := ctx.SessionHTTPClient.FetchWithContext(
 		ctx.Context,
@@ -634,7 +631,7 @@ func fetchMediaInfo(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 			"User-Agent":       webUserAgent,
 			"Accept":           "*/*",
 			"Accept-Language":  "en-US,en;q=0.9",
-			"Referer":          fmt.Sprintf(postPageURL, ctx.ContentID),
+			"Referer":          referer,
 			"X-IG-App-ID":      webAppID,
 			"X-ASBD-ID":        "359341",
 			"X-IG-WWW-Claim":   "0",
