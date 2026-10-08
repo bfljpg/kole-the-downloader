@@ -2,12 +2,10 @@ package instagram
 
 import (
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
-	"math/big"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -26,8 +24,14 @@ import (
 )
 
 const (
-	graphQLEndpoint = "https://www.instagram.com/graphql/query/"
-	polarisAction   = "PolarisPostActionLoadPostQueryQuery"
+	postPageURL     = "https://www.instagram.com/p/%s/"
+	graphQLEndpoint = "https://www.instagram.com/graphql/query"
+	webInfoQuery    = "PolarisPostRootQuery"
+	// doc_id of webInfoQuery, taken from the web client bundle.
+	// it goes stale when instagram deploys a new web client.
+	webInfoDocID = "29131271483123635"
+	webAppID     = "936619743392459"
+	webUserAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
 
 	igramHostname = "api-wh.igram.world"
 	igramAPIBase  = "api.igram.world"
@@ -38,6 +42,17 @@ const (
 var (
 	embedPattern = regexp.MustCompile(
 		`new ServerJS\(\)\);s\.handle\(({.*})\);requireLazy`)
+
+	lsdPattern          = regexp.MustCompile(`\["LSD",\[\],\{"token":"([^"]+)"`)
+	revPattern          = regexp.MustCompile(`"client_revision":(\d+)`)
+	hsiPattern          = regexp.MustCompile(`"hsi":"(\d+)"`)
+	hasteSessionPattern = regexp.MustCompile(`"haste_session":"([^"]+)"`)
+
+	pageHeaders = map[string]string{
+		"User-Agent":      webUserAgent,
+		"Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+		"Accept-Language": "en-US,en;q=0.9",
+	}
 
 	webHeaders = map[string]string{
 		"Accept":                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
@@ -124,6 +139,62 @@ func gqlMediaFormat(node *Media) *models.MediaFormat {
 		Type:     database.MediaTypePhoto,
 		URL:      []string{node.DisplayURL},
 	}
+}
+
+// ParseWebInfoMedia builds media from a PolarisPostRootQuery item.
+func ParseWebInfoMedia(ctx *models.ExtractorContext, item *WebInfoItem) (*models.Media, error) {
+	media := ctx.NewMedia()
+	if item.Caption != nil {
+		media.SetCaption(item.Caption.Text)
+	}
+
+	if len(item.CarouselMedia) > 0 {
+		for i, child := range item.CarouselMedia {
+			format := webInfoFormat(child)
+			if format == nil {
+				return nil, fmt.Errorf("no media url found for sidecar item at index %d", i)
+			}
+			media.NewItem().AddFormats(format)
+		}
+		return media, nil
+	}
+
+	format := webInfoFormat(item)
+	if format == nil {
+		return nil, fmt.Errorf("no media url found")
+	}
+	media.NewItem().AddFormats(format)
+	return media, nil
+}
+
+func webInfoFormat(item *WebInfoItem) *models.MediaFormat {
+	var thumbnail *Candidates
+	if item.ImageVersions != nil {
+		thumbnail = GetBestCandidate(item.ImageVersions.Candidates)
+	}
+	if video := GetBestVideoVersion(item.VideoVersions); video != nil && video.URL != "" {
+		format := &models.MediaFormat{
+			FormatID:   "video",
+			Type:       database.MediaTypeVideo,
+			VideoCodec: database.MediaCodecAvc,
+			AudioCodec: database.MediaCodecAac,
+			URL:        []string{video.URL},
+			Width:      int32(video.Width),
+			Height:     int32(video.Height),
+		}
+		if thumbnail != nil && thumbnail.URL != "" {
+			format.ThumbnailURL = []string{thumbnail.URL}
+		}
+		return format
+	}
+	if thumbnail != nil && thumbnail.URL != "" {
+		return &models.MediaFormat{
+			FormatID: "image",
+			Type:     database.MediaTypePhoto,
+			URL:      []string{thumbnail.URL},
+		}
+	}
+	return nil
 }
 
 func ParseEmbedGQL(body []byte) (*Media, error) {
@@ -287,40 +358,110 @@ func GetCDNURL(contentURL string) (string, error) {
 	return cdnURL, nil
 }
 
-func GetGQLData(ctx *models.ExtractorContext) (*GraphQLData, error) {
-	graphHeaders, body, err := BuildGQLData()
+// webTokens are the values the web client reads from the post page
+// before sending a query. a logged out visitor gets them too.
+type webTokens struct {
+	LSD, Rev, HSI, HasteSession string
+}
+
+func ParseWebTokens(body []byte) (*webTokens, error) {
+	lsd := lsdPattern.FindSubmatch(body)
+	rev := revPattern.FindSubmatch(body)
+	if lsd == nil || rev == nil {
+		return nil, fmt.Errorf("lsd or client revision not found")
+	}
+	tokens := &webTokens{LSD: string(lsd[1]), Rev: string(rev[1])}
+	if m := hsiPattern.FindSubmatch(body); m != nil {
+		tokens.HSI = string(m[1])
+	}
+	if m := hasteSessionPattern.FindSubmatch(body); m != nil {
+		tokens.HasteSession = string(m[1])
+	}
+	return tokens, nil
+}
+
+func GetGQLData(ctx *models.ExtractorContext) (*WebInfoItem, error) {
+	pageResp, err := ctx.Fetch(
+		http.MethodGet,
+		fmt.Sprintf(postPageURL, ctx.ContentID),
+		&networking.RequestParams{Headers: pageHeaders},
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to build GQL data: %w", err)
+		return nil, fmt.Errorf("failed to fetch post page: %w", err)
 	}
-	formData := url.Values{}
-	for key, value := range body {
-		formData.Set(key, value)
+	defer pageResp.Body.Close()
+
+	if pageResp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch post page: %s", pageResp.Status)
 	}
-	formData.Set("fb_api_caller_class", "RelayModern")
-	formData.Set("fb_api_req_friendly_name", polarisAction)
-	variables := map[string]any{
+	page, err := io.ReadAll(pageResp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read post page: %w", err)
+	}
+	tokens, err := ParseWebTokens(page)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse post page: %w", err)
+	}
+	cookies := pageResp.Cookies()
+	var csrfToken string
+	for _, cookie := range cookies {
+		if cookie.Name == "csrftoken" {
+			csrfToken = cookie.Value
+		}
+	}
+
+	variables, err := sonic.ConfigFastest.Marshal(map[string]any{
 		"shortcode":               ctx.ContentID,
 		"fetch_tagged_user_count": nil,
 		"hoisted_comment_id":      nil,
 		"hoisted_reply_id":        nil,
-	}
-	variablesJSON, err := sonic.ConfigFastest.Marshal(variables)
+		"__relay_internal__pv__PolarisShortDramaEnabledrelayprovider":           false,
+		"__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": false,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal variables: %w", err)
 	}
-	formData.Set("variables", string(variablesJSON))
-	formData.Set("server_timestamps", "true")
-	formData.Set("doc_id", "8845758582119845") // idk what this is
-
-	for key, value := range webHeaders {
-		graphHeaders[key] = value
+	form := url.Values{
+		"av":                       {"0"},
+		"__d":                      {"www"},
+		"__user":                   {"0"},
+		"__a":                      {"1"},
+		"__req":                    {"1"},
+		"__hs":                     {tokens.HasteSession},
+		"__hsi":                    {tokens.HSI},
+		"__rev":                    {tokens.Rev},
+		"__spin_r":                 {tokens.Rev},
+		"__spin_b":                 {"trunk"},
+		"__ccg":                    {"EXCELLENT"},
+		"__comet_req":              {"7"},
+		"dpr":                      {"1"},
+		"lsd":                      {tokens.LSD},
+		"jazoest":                  {"2999"},
+		"fb_api_caller_class":      {"RelayModern"},
+		"fb_api_req_friendly_name": {webInfoQuery},
+		"variables":                {string(variables)},
+		"server_timestamps":        {"true"},
+		"doc_id":                   {webInfoDocID},
 	}
 	resp, err := ctx.Fetch(
 		http.MethodPost,
 		graphQLEndpoint,
 		&networking.RequestParams{
-			Headers: graphHeaders,
-			Body:    strings.NewReader(formData.Encode()),
+			Headers: map[string]string{
+				"User-Agent":         webUserAgent,
+				"Accept-Language":    "en-US,en;q=0.9",
+				"Content-Type":       "application/x-www-form-urlencoded",
+				"Origin":             "https://www.instagram.com",
+				"Referer":            fmt.Sprintf(postPageURL, ctx.ContentID),
+				"Sec-Fetch-Site":     "same-origin",
+				"X-FB-LSD":           tokens.LSD,
+				"X-CSRFToken":        csrfToken,
+				"X-IG-App-ID":        webAppID,
+				"X-ASBD-ID":          "359341",
+				"X-FB-Friendly-Name": webInfoQuery,
+			},
+			Cookies: cookies,
+			Body:    strings.NewReader(form.Encode()),
 		},
 	)
 	if err != nil {
@@ -338,89 +479,16 @@ func GetGQLData(ctx *models.ExtractorContext) (*GraphQLData, error) {
 	if err := decoder.Decode(&response); err != nil {
 		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
-	if response.Data == nil {
+	if response.Data == nil || response.Data.WebInfo == nil {
+		if len(response.Errors) > 0 {
+			return nil, fmt.Errorf("graphql error: %s", response.Errors[0].Message)
+		}
 		return nil, fmt.Errorf("data is nil")
 	}
-	if response.Status != "ok" {
-		return nil, fmt.Errorf("status is not ok: %s", response.Status)
+	if len(response.Data.WebInfo.Items) == 0 {
+		return nil, util.ErrUnavailable
 	}
-	if response.Data.ShortcodeMedia == nil {
-		return nil, fmt.Errorf("shortcode_media is nil")
-	}
-	return response.Data, nil
-}
-
-func BuildGQLData() (map[string]string, map[string]string, error) {
-	const (
-		domain                = "www"
-		requestID             = "b"
-		clientCapabilityGrade = "EXCELLENT"
-		sessionInternalID     = "7436540909012459023"
-		apiVersion            = "1"
-		rolloutHash           = "1019933358"
-		appID                 = "936619743392459"
-		bloksVersionID        = "6309c8d03d8a3f47a1658ba38b304a3f837142ef5f637ebf1f8f52d4b802951e"
-		asbdID                = "129477"
-		hiddenState           = "20126.HYP:instagram_web_pkg.2.1...0"
-		loggedIn              = "0"
-		cometRequestID        = "7"
-		appVersion            = "0"
-		pixelRatio            = "2"
-		buildType             = "trunk"
-	)
-	session := "::" + util.RandomAlphaString(6)
-	sessionData := util.RandomBase64(8)
-	csrfToken := util.RandomBase64(32)
-	deviceID := util.RandomBase64(24)
-	machineID := util.RandomBase64(24)
-	dynamicFlags := util.RandomBase64(154)
-	clientSessionRnd := util.RandomBase64(154)
-	jazoestBig, err := rand.Int(rand.Reader, big.NewInt(10000))
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate jazoest: %w", err)
-	}
-	jazoest := strconv.FormatInt(jazoestBig.Int64()+1, 10)
-	timestamp := strconv.FormatInt(time.Now().Unix(), 10)
-	cookies := []string{
-		"csrftoken=" + csrfToken,
-		"ig_did=" + deviceID,
-		"wd=1280x720",
-		"dpr=2",
-		"mid=" + machineID,
-		"ig_nrcb=1",
-	}
-	headers := map[string]string{
-		"x-ig-app-id":        appID,
-		"X-FB-LSD":           sessionData,
-		"X-CSRFToken":        csrfToken,
-		"X-Bloks-Version-Id": bloksVersionID,
-		"x-asbd-id":          asbdID,
-		"cookie":             strings.Join(cookies, "; "),
-		"Content-Type":       "application/x-www-form-urlencoded",
-		"X-FB-Friendly-Name": polarisAction,
-	}
-	body := map[string]string{
-		"__d":         domain,
-		"__a":         apiVersion,
-		"__s":         session,
-		"__hs":        hiddenState,
-		"__req":       requestID,
-		"__ccg":       clientCapabilityGrade,
-		"__rev":       rolloutHash,
-		"__hsi":       sessionInternalID,
-		"__dyn":       dynamicFlags,
-		"__csr":       clientSessionRnd,
-		"__user":      loggedIn,
-		"__comet_req": cometRequestID,
-		"libav":       appVersion,
-		"dpr":         pixelRatio,
-		"lsd":         sessionData,
-		"jazoest":     jazoest,
-		"__spin_r":    rolloutHash,
-		"__spin_b":    buildType,
-		"__spin_t":    timestamp,
-	}
-	return headers, body, nil
+	return response.Data.WebInfo.Items[0], nil
 }
 
 func GetBestCandidate(candidates []*Candidates) *Candidates {

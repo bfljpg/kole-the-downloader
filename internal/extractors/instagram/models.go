@@ -1,12 +1,32 @@
 package instagram
 
 type GraphQLResponse struct {
-	Data   *GraphQLData `json:"data"`
-	Status string       `json:"status"`
+	Data   *GraphQLData    `json:"data"`
+	Errors []*GraphQLError `json:"errors"`
 }
 
 type GraphQLData struct {
-	ShortcodeMedia *Media `json:"xdt_shortcode_media"`
+	WebInfo *WebInfo `json:"xdt_api__v1__media__shortcode__web_info"`
+}
+
+type GraphQLError struct {
+	Message string `json:"message"`
+}
+
+type WebInfo struct {
+	Items []*WebInfoItem `json:"items"`
+}
+
+// WebInfoItem is a post, a reel or a single carousel child.
+type WebInfoItem struct {
+	Caption       *WebInfoCaption  `json:"caption"`
+	ImageVersions *ImageVersions   `json:"image_versions2"`
+	VideoVersions []*VideoVersions `json:"video_versions"`
+	CarouselMedia []*WebInfoItem   `json:"carousel_media"`
+}
+
+type WebInfoCaption struct {
+	Text string `json:"text"`
 }
 
 type ContextJSON struct {

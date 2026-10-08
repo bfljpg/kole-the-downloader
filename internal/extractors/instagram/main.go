@@ -86,11 +86,11 @@ var ShareURLExtractor = &models.Extractor{
 }
 
 func GetGQLMedia(ctx *models.ExtractorContext) (*models.Media, error) {
-	graphData, err := GetGQLData(ctx)
+	item, err := GetGQLData(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get graph data: %w", err)
 	}
-	return ParseGQLMedia(ctx, graphData.ShortcodeMedia)
+	return ParseWebInfoMedia(ctx, item)
 }
 
 func GetEmbedMedia(ctx *models.ExtractorContext) (*models.Media, error) {
