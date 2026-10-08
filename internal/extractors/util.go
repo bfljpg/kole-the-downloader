@@ -73,14 +73,15 @@ func FromURL(url string) *models.ExtractorContext {
 		}
 
 		extractorCtx := &models.ExtractorContext{
-			ContentID:    groups["id"],
-			ContentURL:   groups["match"],
-			MatchGroups:  groups,
-			Extractor:    extractor,
-			Context:      ctx,
-			CancelFunc:   cancel,
-			Config:       cfg,
-			FilesTracker: models.NewFilesTracker(),
+			ContentID:         groups["id"],
+			ContentURL:        groups["match"],
+			MatchGroups:       groups,
+			Extractor:         extractor,
+			Context:           ctx,
+			CancelFunc:        cancel,
+			Config:            cfg,
+			FilesTracker:      models.NewFilesTracker(),
+			SessionHTTPClient: newSessionClient(extractor.ID, cfg),
 			HTTPClient: networking.NewHTTPClient(
 				&networking.NewHTTPClientOptions{
 					Cookies:       util.GetExtractorCookies(extractor.ID),
@@ -140,4 +141,22 @@ func getExtractorsMap() map[string][]*models.Extractor {
 
 func getExtractorsByHost(host string) []*models.Extractor {
 	return extractorsByHost[host]
+}
+
+// newSessionClient builds the client used for requests that need a logged
+// in session. it only exists when both session cookies and a session proxy
+// are configured, so a session can never be used from the server's own ip.
+func newSessionClient(extractorID string, cfg *config.ExtractorConfig) *networking.HTTPClient {
+	cookies := util.GetExtractorSessionCookies(extractorID)
+	if len(cookies) == 0 {
+		return nil
+	}
+	if cfg.SessionProxy == "" {
+		logger.L.Debugf("[%s] session cookies found but session_proxy is not set, session disabled", extractorID)
+		return nil
+	}
+	return networking.NewHTTPClient(&networking.NewHTTPClientOptions{
+		Cookies: cookies,
+		Proxy:   cfg.SessionProxy,
+	})
 }

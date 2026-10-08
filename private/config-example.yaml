@@ -5,3 +5,6 @@ youtube:
 instagram:
   proxy: http://localhost:8080
   download_proxy: http://localhost:8081
+  # used only for requests that need a logged in session
+  # (session cookies go in private/cookies/instagram-session.txt)
+  session_proxy: http://user:pass@localhost:8082

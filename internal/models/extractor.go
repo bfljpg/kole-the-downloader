@@ -32,7 +32,10 @@ type ExtractorContext struct {
 	Extractor   *Extractor
 	Chat        *database.GetOrCreateChatRow
 	HTTPClient  *networking.HTTPClient
-	Config      *config.ExtractorConfig
+	// logged in client, always routed through session_proxy.
+	// nil when there is no session or no session_proxy is set.
+	SessionHTTPClient *networking.HTTPClient
+	Config            *config.ExtractorConfig
 
 	// allow to track downloaded files
 	FilesTracker *FilesTracker

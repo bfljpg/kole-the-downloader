@@ -1,7 +1,10 @@
 package config
 
 import (
+	"errors"
+	"fmt"
 	"maps"
+	"net/url"
 	"os"
 
 	"github.com/govdbot/govd/internal/logger"
@@ -49,6 +52,9 @@ func validateConfig() {
 		if active > 1 {
 			logger.L.Fatalf("[%s] invalid config: cannot enable more than one proxy option at the same time", id)
 		}
+		if err := validateSessionProxy(cfg.SessionProxy); err != nil {
+			logger.L.Fatalf("[%s] invalid config: session_proxy: %v", id, err)
+		}
 		if len(cfg.Instance) > 0 && id != "youtube" {
 			logger.L.Fatalf("[%s] invalid config: custom instance is only supported for youtube extractor", id)
 		}
@@ -58,6 +64,27 @@ func validateConfig() {
 			}
 		}
 	}
+}
+
+// validateSessionProxy makes sure a session proxy is usable, as a bad
+// url must never make session requests fall back to a direct connection.
+func validateSessionProxy(raw string) error {
+	if raw == "" {
+		return nil
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid url: %w", err)
+	}
+	switch u.Scheme {
+	case "http", "https", "socks5", "socks5h":
+	default:
+		return fmt.Errorf("unsupported scheme %q (use http, https, socks5 or socks5h)", u.Scheme)
+	}
+	if u.Hostname() == "" || u.Port() == "" {
+		return errors.New("host and port are required")
+	}
+	return nil
 }
 
 func GetExtractorConfig(extractorID string) *ExtractorConfig {
