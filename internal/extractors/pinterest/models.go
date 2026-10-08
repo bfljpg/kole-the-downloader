@@ -60,3 +60,13 @@ type Embed struct {
 	Type string `json:"type"`
 	Src  string `json:"src"`
 }
+
+type SearchResponse struct {
+	ResourceResponse struct {
+		Data []SearchPin `json:"data"`
+	} `json:"resource_response"`
+}
+
+type SearchPin struct {
+	ID string `json:"id"`
+}

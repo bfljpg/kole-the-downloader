@@ -2,11 +2,13 @@ package pinterest
 
 import (
 	"fmt"
+	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/govdbot/govd/internal/database"
 	"github.com/govdbot/govd/internal/models"
+	"github.com/govdbot/govd/internal/networking"
 	"github.com/govdbot/govd/internal/util/parser/m3u8"
 
 	"github.com/bytedance/sonic"
@@ -67,4 +69,49 @@ func BuildPinRequestParams(pinID string) string {
 		values.Set(key, value)
 	}
 	return values.Encode()
+}
+
+func BuildSearchRequestParams(query string) string {
+	options := map[string]any{
+		"options": map[string]any{
+			"query":         query,
+			"scope":         "pins",
+			"page_size":     1,
+			"field_set_key": "react_grid_pin",
+		},
+	}
+	jsonData, _ := sonic.ConfigFastest.Marshal(options)
+	values := url.Values{}
+	values.Set("data", string(jsonData))
+	return values.Encode()
+}
+
+func GetFirstPinIDFromIdeas(ctx *models.ExtractorContext, keyword string) (string, error) {
+	resp, err := ctx.Fetch(
+		http.MethodGet,
+		searchResourceEndpoint+"?"+BuildSearchRequestParams(keyword),
+		&networking.RequestParams{
+			Headers: headers,
+		},
+	)
+	if err != nil {
+		return "", fmt.Errorf("failed to send search request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("bad search response: %s", resp.Status)
+	}
+
+	var searchResponse SearchResponse
+	decoder := sonic.ConfigFastest.NewDecoder(resp.Body)
+	if err := decoder.Decode(&searchResponse); err != nil {
+		return "", fmt.Errorf("failed to parse search response: %w", err)
+	}
+
+	pins := searchResponse.ResourceResponse.Data
+	if len(pins) == 0 {
+		return "", fmt.Errorf("no pins found for keyword: %s", keyword)
+	}
+	return pins[0].ID, nil
 }

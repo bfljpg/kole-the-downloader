@@ -14,8 +14,9 @@ import (
 )
 
 const (
-	pinResourceEndpoint = "https://www.pinterest.com/resource/PinResource/get/"
-	shortenerAPIFormat  = "https://api.pinterest.com/url_shortener/%s/redirect/"
+	pinResourceEndpoint    = "https://www.pinterest.com/resource/PinResource/get/"
+	searchResourceEndpoint = "https://www.pinterest.com/resource/SearchResource/get/"
+	shortenerAPIFormat     = "https://api.pinterest.com/url_shortener/%s/redirect/"
 )
 
 var ShortExtractor = &models.Extractor{
@@ -45,6 +46,29 @@ var Extractor = &models.Extractor{
 	Host:       []string{"pinterest"},
 
 	GetFunc: func(ctx *models.ExtractorContext) (*models.ExtractorResponse, error) {
+		media, err := ExtractPinMedia(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return &models.ExtractorResponse{Media: media}, nil
+	},
+}
+
+// IdeasExtractor handles /ideas/<keyword>/<id> pages, which are not a single
+// pin: the first pin found for the keyword is downloaded.
+var IdeasExtractor = &models.Extractor{
+	ID:          "pinterest",
+	DisplayName: "Pinterest (Ideas)",
+
+	URLPattern: regexp.MustCompile(`https?://(?:[^/]+\.)?pinterest\.[^/]+/ideas/(?P<id>[\w-]+)/\d+`),
+	Host:       []string{"pinterest"},
+
+	GetFunc: func(ctx *models.ExtractorContext) (*models.ExtractorResponse, error) {
+		pinID, err := GetFirstPinIDFromIdeas(ctx, ctx.ContentID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get pin from ideas: %w", err)
+		}
+		ctx.ContentID = pinID
 		media, err := ExtractPinMedia(ctx)
 		if err != nil {
 			return nil, err
