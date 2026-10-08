@@ -1,6 +1,7 @@
 package instagram
 
 import (
+	"errors"
 	"testing"
 
 	"github.com/bytedance/sonic"
@@ -100,6 +101,31 @@ func TestParseWebInfoMedia(t *testing.T) {
 			}
 			if tt.name == "photo" && media.Items[0].Formats[0].URL[0] != "https://cdn/big.jpg" {
 				t.Fatalf("expected the widest image, got %v", media.Items[0].Formats[0].URL)
+			}
+		})
+	}
+}
+
+func TestParseGraphQLResponse(t *testing.T) {
+	tests := []struct {
+		name         string
+		body         string
+		wantRejected bool
+		wantErr      bool
+	}{
+		{"data", `{"data":{"xdt_api__v1__media__shortcode__web_info":{"items":[]}}}`, false, false},
+		{"rejected with prefix", `for (;;);{"error":1357004,"errorSummary":"Sorry, something went wrong"}`, true, true},
+		{"graphql errors are not rejections", `{"data":null,"errors":[{"message":"field_exception"}]}`, false, false},
+		{"not json", `<html>blocked</html>`, false, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseGraphQLResponse([]byte(tt.body))
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr %v", err, tt.wantErr)
+			}
+			if errors.Is(err, errGraphQLRejected) != tt.wantRejected {
+				t.Fatalf("rejected = %v, want %v (err: %v)", errors.Is(err, errGraphQLRejected), tt.wantRejected, err)
 			}
 		})
 	}

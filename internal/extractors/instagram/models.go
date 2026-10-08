@@ -3,6 +3,10 @@ package instagram
 type GraphQLResponse struct {
 	Data   *GraphQLData    `json:"data"`
 	Errors []*GraphQLError `json:"errors"`
+
+	// set on rejected requests (body prefixed with "for (;;);")
+	ErrorCode    int    `json:"error"`
+	ErrorSummary string `json:"errorSummary"`
 }
 
 type GraphQLData struct {

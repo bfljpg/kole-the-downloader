@@ -1,9 +1,11 @@
 package instagram
 
 import (
+	"bytes"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -380,7 +382,40 @@ func ParseWebTokens(body []byte) (*webTokens, error) {
 	return tokens, nil
 }
 
+// errGraphQLRejected means instagram answered with an error payload
+// instead of data, which can be transient.
+var errGraphQLRejected = errors.New("graphql request rejected")
+
 func GetGQLData(ctx *models.ExtractorContext) (*WebInfoItem, error) {
+	var (
+		item *WebInfoItem
+		err  error
+	)
+	for range 2 {
+		item, err = fetchWebInfo(ctx)
+		if !errors.Is(err, errGraphQLRejected) {
+			return item, err
+		}
+		ctx.Debugf("graphql request rejected, retrying: %v", err)
+	}
+	return nil, err
+}
+
+// ParseGraphQLResponse decodes a graphql body, which instagram
+// prefixes with "for (;;);" on rejected requests.
+func ParseGraphQLResponse(body []byte) (*GraphQLResponse, error) {
+	trimmed := bytes.TrimPrefix(bytes.TrimSpace(body), []byte("for (;;);"))
+	var response GraphQLResponse
+	if err := sonic.ConfigFastest.Unmarshal(trimmed, &response); err != nil {
+		return nil, fmt.Errorf("failed to parse response: %w (body: %.200q)", err, body)
+	}
+	if response.ErrorCode != 0 {
+		return nil, fmt.Errorf("%w: %d %s", errGraphQLRejected, response.ErrorCode, response.ErrorSummary)
+	}
+	return &response, nil
+}
+
+func fetchWebInfo(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 	pageResp, err := ctx.Fetch(
 		http.MethodGet,
 		fmt.Sprintf(postPageURL, ctx.ContentID),
@@ -474,10 +509,13 @@ func GetGQLData(ctx *models.ExtractorContext) (*WebInfoItem, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("invalid response code: %s", resp.Status)
 	}
-	var response GraphQLResponse
-	decoder := sonic.ConfigFastest.NewDecoder(resp.Body)
-	if err := decoder.Decode(&response); err != nil {
-		return nil, fmt.Errorf("failed to parse response: %w", err)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+	response, err := ParseGraphQLResponse(body)
+	if err != nil {
+		return nil, err
 	}
 	if response.Data == nil || response.Data.WebInfo == nil {
 		if len(response.Errors) > 0 {
