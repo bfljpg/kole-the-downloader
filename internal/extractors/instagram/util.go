@@ -69,59 +69,61 @@ func ParseGQLMedia(ctx *models.ExtractorContext, data *Media) (*models.Media, er
 	media := ctx.NewMedia()
 	media.SetCaption(caption)
 
-	switch data.Typename {
-	case "GraphVideo", "XDTGraphVideo":
-		item := media.NewItem()
-		item.AddFormats(&models.MediaFormat{
+	if data.EdgeSidecarToChildren != nil && len(data.EdgeSidecarToChildren.Edges) > 0 {
+		for i, edge := range data.EdgeSidecarToChildren.Edges {
+			format := gqlMediaFormat(edge.Node)
+			if format == nil {
+				return nil, fmt.Errorf("no media url found for sidecar item at index %d", i)
+			}
+			media.NewItem().AddFormats(format)
+		}
+		return media, nil
+	}
+
+	format := gqlMediaFormat(data)
+	if format == nil {
+		return nil, fmt.Errorf("no media url found")
+	}
+	media.NewItem().AddFormats(format)
+	return media, nil
+}
+
+// gqlMediaFormat builds a format from a single GQL media node, or
+// returns nil if the node has no usable url. embed pages omit
+// __typename on sidecar children, so rely on the data itself.
+func gqlMediaFormat(node *Media) *models.MediaFormat {
+	if node == nil {
+		return nil
+	}
+	var width, height int32
+	if node.Dimensions != nil {
+		width, height = node.Dimensions.Width, node.Dimensions.Height
+	}
+	isVideo := node.IsVideo || node.VideoURL != "" ||
+		node.Typename == "GraphVideo" || node.Typename == "XDTGraphVideo"
+	if isVideo {
+		if node.VideoURL == "" {
+			return nil
+		}
+		return &models.MediaFormat{
 			FormatID:     "video",
 			Type:         database.MediaTypeVideo,
 			VideoCodec:   database.MediaCodecAvc,
 			AudioCodec:   database.MediaCodecAac,
-			URL:          []string{data.VideoURL},
-			ThumbnailURL: []string{data.DisplayURL},
-			Width:        data.Dimensions.Width,
-			Height:       data.Dimensions.Height,
-		})
-	case "GraphImage", "XDTGraphImage":
-		item := media.NewItem()
-		item.AddFormats(&models.MediaFormat{
-			FormatID: "image",
-			Type:     database.MediaTypePhoto,
-			URL:      []string{data.DisplayURL},
-		})
-	case "GraphSidecar", "XDTGraphSidecar":
-		if data.EdgeSidecarToChildren != nil && len(data.EdgeSidecarToChildren.Edges) > 0 {
-			edges := data.EdgeSidecarToChildren.Edges
-
-			for i := range edges {
-				item := media.NewItem()
-				node := edges[i].Node
-
-				switch node.Typename {
-				case "GraphVideo", "XDTGraphVideo":
-					item.AddFormats(&models.MediaFormat{
-						FormatID:     "video",
-						Type:         database.MediaTypeVideo,
-						VideoCodec:   database.MediaCodecAvc,
-						AudioCodec:   database.MediaCodecAac,
-						URL:          []string{node.VideoURL},
-						ThumbnailURL: []string{node.DisplayURL},
-						Width:        node.Dimensions.Width,
-						Height:       node.Dimensions.Height,
-					})
-
-				case "GraphImage", "XDTGraphImage":
-					item.AddFormats(&models.MediaFormat{
-						FormatID: "image",
-						Type:     database.MediaTypePhoto,
-						URL:      []string{node.DisplayURL},
-					})
-				}
-			}
+			URL:          []string{node.VideoURL},
+			ThumbnailURL: []string{node.DisplayURL},
+			Width:        width,
+			Height:       height,
 		}
 	}
-
-	return media, nil
+	if node.DisplayURL == "" {
+		return nil
+	}
+	return &models.MediaFormat{
+		FormatID: "image",
+		Type:     database.MediaTypePhoto,
+		URL:      []string{node.DisplayURL},
+	}
 }
 
 func ParseEmbedGQL(body []byte) (*Media, error) {
