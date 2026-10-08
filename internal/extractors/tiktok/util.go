@@ -29,13 +29,40 @@ var (
 )
 
 func GetVideoWeb(ctx *models.ExtractorContext) (*WebItemStruct, []*http.Cookie, error) {
-	awemeID := ctx.ContentID
+	resp, body, err := fetchVideoPage(ctx, nil)
+	if err != nil {
+		return nil, nil, err
+	}
 
+	wafCookies, err := SolveWAFChallenge(body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to solve waf challenge: %w", err)
+	}
+	if wafCookies != nil {
+		ctx.Debugf("waf challenge detected, retrying with solution")
+		resp, body, err = fetchVideoPage(ctx, wafCookies)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+
+	itemStruct, err := ParseUniversalData(body)
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to parse universal data: %w", err)
+	}
+	return itemStruct, resp.Cookies(), nil
+}
+
+func fetchVideoPage(
+	ctx *models.ExtractorContext,
+	cookies []*http.Cookie,
+) (*http.Response, []byte, error) {
 	resp, err := ctx.Fetch(
 		http.MethodGet,
-		videoURLBase+awemeID,
+		videoURLBase+ctx.ContentID,
 		&networking.RequestParams{
 			Headers: webHeaders,
+			Cookies: cookies,
 		},
 	)
 	if err != nil {
@@ -51,12 +78,7 @@ func GetVideoWeb(ctx *models.ExtractorContext) (*WebItemStruct, []*http.Cookie, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to read response body: %w", err)
 	}
-
-	itemStruct, err := ParseUniversalData(body)
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse universal data: %w", err)
-	}
-	return itemStruct, resp.Cookies(), nil
+	return resp, body, nil
 }
 
 func ParseUniversalData(body []byte) (*WebItemStruct, error) {
